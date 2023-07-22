@@ -69,7 +69,6 @@ extern uint8_t quit_rx_ring;
 
 extern uint32_t incoming_idx;
 extern node_t *incoming_array;
-extern application_node_t *application_array;
 
 void clean_heap();
 void wait_timeout();
