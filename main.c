@@ -13,19 +13,20 @@
 #include "dpdk_util.h"
 
 // Application parameters
+uint64_t rate;
 uint32_t seed;
 uint64_t duration;
 uint64_t nr_flows;
-uint64_t nr_packets;
+uint64_t nr_queues;
 uint32_t min_lcores;
 uint32_t frame_size;
 uint32_t tcp_payload_size;
 
 // General variables
 uint64_t TICKS_PER_US;
-uint16_t *flow_indexes_array;
-uint32_t *interarrival_array;
-application_node_t *application_array;
+uint16_t **flow_indexes_array;
+uint32_t **interarrival_array;
+application_node_t **application_array;
 
 // Heap and DPDK allocated
 uint32_t incoming_idx;
@@ -38,7 +39,7 @@ tcp_control_block_t *tcp_control_blocks;
 uint8_t quit_rx = 0;
 uint8_t quit_tx = 0;
 uint8_t quit_rx_ring = 0;
-uint32_t nr_never_sent = 0;
+uint32_t *nr_never_sent = 0;
 lcore_param lcore_params[RTE_MAX_LCORE];
 struct rte_ring *rx_ring;
 
@@ -107,6 +108,82 @@ int process_rx_pkt(struct rte_mbuf *pkt, node_t *incoming, uint32_t *incoming_id
 	node->worker_id = w_id;
 
 	return 1;
+}
+
+// Start the client establishing all TCP connections
+void start_client(uint16_t portid) {
+	uint16_t nb_rx;
+	uint16_t nb_tx;
+	uint64_t ts_syn;
+	uint32_t nb_retransmission;
+	struct rte_mbuf *pkt;
+	tcp_control_block_t *block;
+	struct rte_mbuf *pkts[BURST_SIZE];
+
+	for(int i = 0; i < nr_flows; i++) {
+		// get the TCP control block for the flow
+		block = &tcp_control_blocks[i];
+		// create the TCP SYN packet
+		struct rte_mbuf *syn_packet = create_syn_packet(i);
+		// insert the rte_flow in the NIC to retrieve the flow id for incoming packets of this flow
+		insert_flow(portid, i);
+
+		// send the SYN packet
+		struct rte_mbuf *syn_cloned = rte_pktmbuf_clone(syn_packet, pktmbuf_pool_tx);
+		nb_tx = rte_eth_tx_burst(portid, i % nr_queues, &syn_cloned, 1);
+		if(nb_tx != 1) {
+			rte_exit(EXIT_FAILURE, "Error to send the TCP SYN packet.\n");
+		}
+
+		// clear the counters
+		nb_retransmission = 1;
+		ts_syn = rte_rdtsc();
+
+		// change the TCP state to SYN_SENT
+		rte_atomic16_set(&block->tcb_state, TCP_SYN_SENT);
+
+		// while not received SYN+ACK packet and TCP state is not ESTABLISHED
+		while(rte_atomic16_read(&block->tcb_state) != TCP_ESTABLISHED) {
+			// receive TCP SYN+ACK packets from the NIC
+			nb_rx = rte_eth_rx_burst(portid, 0, pkts, BURST_SIZE);
+
+			for(int j = 0; j < nb_rx; j++) {
+				// process the SYN+ACK packet, returning the ACK packet to send
+				pkt = process_syn_ack_packet(pkts[j]);
+				
+				if(pkt) {
+					// send the TCP ACK packet to the server
+					nb_tx = rte_eth_tx_burst(portid, i % nr_queues, &pkt, 1);
+					if(nb_tx != 1) {
+						rte_exit(EXIT_FAILURE, "Error to send the TCP ACK packet.\n");
+					}
+				}
+			}
+			// free packets
+			rte_pktmbuf_free_bulk(pkts, nb_rx);
+
+			if((rte_rdtsc() - ts_syn) > (nb_retransmission * HANDSHAKE_TIMEOUT_IN_US) * TICKS_PER_US) {
+				nb_retransmission++;
+				syn_cloned = rte_pktmbuf_clone(syn_packet, pktmbuf_pool_tx);
+				nb_tx = rte_eth_tx_burst(portid, i % nr_queues, &syn_cloned, 1);
+				if(nb_tx != 1) {
+					rte_exit(EXIT_FAILURE, "Error to send the TCP SYN packet.\n");
+				}
+				ts_syn = rte_rdtsc();
+
+				if(nb_retransmission == HANDSHAKE_RETRANSMISSION) {
+					rte_exit(EXIT_FAILURE, "Cannot establish connection.\n");
+				}
+			}
+		}
+		rte_pktmbuf_free(syn_packet);
+	}
+
+	// Discard 3-way handshake packets in the DPDK metrics
+	rte_eth_stats_reset(portid);
+	rte_eth_xstats_reset(portid);
+	
+	rte_compiler_barrier();
 }
 
 // RX processing
@@ -180,9 +257,9 @@ static int lcore_tx(void *arg) {
 	uint64_t nr_elements = tx_conf->nr_elements;
 
 	struct rte_mbuf *pkt;
-	uint16_t *flow_indexes = flow_indexes_array;
-	uint32_t *interarrival_gap = interarrival_array;
-	application_node_t *app_array = application_array;
+	uint16_t *flow_indexes = flow_indexes_array[qid];
+	uint32_t *interarrival_gap = interarrival_array[qid];
+	application_node_t *app_array = application_array[qid];
 
 	uint64_t next_tsc = rte_rdtsc() + interarrival_gap[0];
 
@@ -190,7 +267,7 @@ static int lcore_tx(void *arg) {
 		// unable to keep up with the requested rate
 		if(unlikely(rte_rdtsc() > (next_tsc + 5*TICKS_PER_US))) {
 			// count this batch as dropped
-			nr_never_sent++;
+			nr_never_sent[qid]++;
 			next_tsc += (interarrival_gap[i] + TICKS_PER_US);
 			continue;
 		}
@@ -209,10 +286,10 @@ static int lcore_tx(void *arg) {
 			rx_wnd = rte_atomic16_read(&block->tcb_rwin);
 		}
 
-		// fill the timestamp, flow id, and the service time into the packet payload
+		// fill the timestamp, flow id, server iterations, and server randomness into the packet payload
 		fill_payload_pkt(pkt, 0, next_tsc);
 		fill_payload_pkt(pkt, 2, (uint64_t) flow_id);
-		fill_payload_pkt(pkt, 4, app_array[i].instructions);
+		fill_payload_pkt(pkt, 4, app_array[i].iterations);
 		fill_payload_pkt(pkt, 5, app_array[i].randomness);
 
 		// sleep for while
@@ -247,10 +324,25 @@ int main(int argc, char **argv) {
 
 	// initialize DPDK
 	uint16_t portid = 0;
-	init_DPDK(portid, 1, seed);
+	init_DPDK(portid, nr_queues, seed);
+
+	// create nodes for incoming packets
+	create_incoming_array();
+
+	// create flow indexes array
+	create_flow_indexes_array();
+
+	// create interarrival array
+	create_interarrival_array();
+
+	// create application array
+	create_application_array();
 
 	// initialize TCP control blocks
 	init_tcp_blocks();
+
+	// start client (3-way handshake for each flow)
+	start_client(portid);
 
 	// create the DPDK ring for RX thread
 	create_dpdk_ring();
@@ -264,13 +356,15 @@ int main(int argc, char **argv) {
 	id_lcore = rte_get_next_lcore(id_lcore, 1, 1);
 	rte_eal_remote_launch(lcore_rx, NULL, id_lcore);
 
-	// start TX thread
-	lcore_params[0].portid = portid;
-	lcore_params[0].qid = 0;
-	lcore_params[0].nr_elements = nr_packets;
+	// start TX threads
+	for(int i = 0; i < nr_queues; i++) {
+		lcore_params[i].portid = portid;
+		lcore_params[i].qid = i;
+		lcore_params[i].nr_elements = (rate/nr_queues) * 2 * duration;
 
-	id_lcore = rte_get_next_lcore(id_lcore, 1, 1);
-	rte_eal_remote_launch(lcore_tx, (void*) &lcore_params[0], id_lcore);
+		id_lcore = rte_get_next_lcore(id_lcore, 1, 1);
+		rte_eal_remote_launch(lcore_tx, (void*) &lcore_params[i], id_lcore);
+	}
 
 	// wait for duration parameter
 	wait_timeout();

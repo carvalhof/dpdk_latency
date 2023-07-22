@@ -22,7 +22,6 @@
 #include <rte_mempool.h>
 
 // Constants
-#define PERCENTILES					11
 #define EPSILON						0.00001
 #define MAXSTRLEN					128
 #define MIN_PKTSIZE					96
@@ -31,11 +30,8 @@
 #define EXPONENTIAL_VALUE			2
 #define BIMODAL_VALUE				3
 #define IPV4_ADDR(a, b, c, d)		(((d & 0xff) << 24) | ((c & 0xff) << 16) | ((b & 0xff) << 8) | (a & 0xff))
-#define PAYLOAD_OFFSET				14+20+20
 
-#define SQRT_APPLICATION_VALUE			0
-#define STRIDEDMEM_APPLICATION_VALUE	1
-#define NULL_APPLICATION_VALUE			2
+#define PAYLOAD_OFFSET				14+20+20
 
 typedef struct lcore_parameters {
 	uint8_t qid;
@@ -51,30 +47,29 @@ typedef struct timestamp_node_t {
 } node_t;
 
 typedef struct application_node_t {
-	uint64_t instructions;
+	uint64_t iterations;
 	uint64_t randomness;
 } application_node_t;
 
+extern uint64_t rate;
 extern uint32_t seed;
 extern uint16_t portid;
 extern uint64_t duration;
 extern uint64_t nr_flows;
-extern uint64_t nr_packets;
+extern uint64_t nr_queues;
 extern uint32_t frame_size;
 extern uint32_t min_lcores;
 extern uint32_t tcp_payload_size;
 
-uint64_t idx;
-uint64_t srv_application;
-double sqrt_time_one_iteration;
-double null_time_one_iteration;
-double stridedmem_time_one_iteration;
-double srv_time_in_ns_per_instruction;
+double srv_mode;
+uint64_t srv_iterations0;
+uint64_t srv_iterations1;
+uint64_t srv_distribution;
 
 extern uint64_t TICKS_PER_US;
-extern uint32_t nr_never_sent;
-extern uint16_t *flow_indexes_array;
-extern uint32_t *interarrival_array;
+extern uint32_t *nr_never_sent;
+extern uint16_t **flow_indexes_array;
+extern uint32_t **interarrival_array;
 
 extern uint16_t dst_tcp_port;
 extern uint32_t dst_ipv4_addr;
@@ -88,7 +83,7 @@ extern uint8_t quit_rx_ring;
 
 extern uint32_t incoming_idx;
 extern node_t *incoming_array;
-extern application_node_t *application_array;
+extern application_node_t **application_array;
 
 void clean_heap();
 void wait_timeout();

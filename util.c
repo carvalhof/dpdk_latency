@@ -16,88 +16,126 @@ static uint32_t process_int_arg(const char *arg) {
 	return strtoul(arg, &end, 10);
 }
 
-uint64_t get_instructions_for_the_server(uint32_t *arr, uint32_t randomness) {
-	uint32_t i = randomness % (PERCENTILES-1);
-	double r = (double)randomness / RAND_MAX;
+// Convert string type into double type
+static double process_double_arg(const char *arg) {
+	char *end;
 
-	uint32_t lb = arr[i];
-	uint32_t ub = arr[i+1];
-
-	uint32_t service_time = (lb + (r * (ub - lb)));
-	
-	return service_time / srv_time_in_ns_per_instruction;
+	return strtod(arg, &end);
 }
 
-uint64_t get_nr_packets(FILE *fp, uint32_t offset) {
-	char buffer[MAXSTRLEN];
+// Allocate and create all application nodes
+void create_application_array() {
+	uint64_t rate_per_queue = rate/nr_queues;
+	uint64_t nr_elements_per_queue = (2 * rate_per_queue * duration);
 
-	// Skipping the first line
-	char* ret __attribute__((unused)) = fgets(buffer, MAXSTRLEN, fp);
-
-	// Skipping until reach to the 'offset' line
-	for(uint32_t i = 0; i < offset; i++) {
-		ret = fgets(buffer, MAXSTRLEN, fp);
+	application_array = (application_node_t**) rte_malloc(NULL, nr_queues * sizeof(application_node_t*), 64);
+	if(application_array == NULL) {
+		rte_exit(EXIT_FAILURE, "Cannot alloc the application array.\n");
 	}
 
-	// Couting the number of packets considering the duration
-	uint64_t n = 0;
-	for(uint32_t i = 0; i < 2*duration; i++) {
-		ret = fgets(buffer, MAXSTRLEN, fp);
-		char *token = strtok(buffer, ",");
-		for(uint32_t j = 0; j < (PERCENTILES+1); j++) {
-			token = strtok(NULL, ",");
+	for(uint64_t i = 0; i < nr_queues; i++) {
+		application_array[i] = (application_node_t*) rte_malloc(NULL, nr_elements_per_queue * sizeof(application_node_t), 0);
+		if(application_array[i] == NULL) {
+			rte_exit(EXIT_FAILURE, "Cannot alloc the application array.\n");
 		}
-		token = strtok(NULL, ",");
-		n += atoi(token);
-	}
 
-	return n;
-}
-
-inline void process() {
-	char *ret __attribute__((unused));
-	ret = strtok(NULL, ",");
-
-	// Get the percentiles, choose one, and update the application_array
-	uint32_t arr[PERCENTILES];
-	for(uint32_t i = 0; i < PERCENTILES; i++) {
-		arr[i] = atoi(ret);
-		ret = strtok(NULL, ",");
-	}
-	
-	// Get the number of packets 
-	ret = strtok(NULL, ","); // Skip the QPS
-	uint32_t queries = atoi(ret);
-	double mean = (1.0/queries) * 1000000.0;
-
-	// Distributed the packets uniformly within 1-sec window
-	// Distributed the service time uniformly
-	for(uint32_t i = 0; i < queries; i++) {
-		uint32_t j = rand();
-		application_array[idx].instructions = get_instructions_for_the_server(arr, j);
-		application_array[idx].randomness = j;
-		interarrival_array[idx] = mean * TICKS_PER_US;
-		idx++;
+		if(srv_distribution == CONSTANT_VALUE) {
+			for(uint32_t j = 0; j < nr_elements_per_queue; j++) {
+				application_array[i][j].iterations = srv_iterations0;
+				application_array[i][j].randomness = rte_rand();
+			}
+		} else if(srv_distribution == EXPONENTIAL_VALUE) {
+			for(uint32_t j = 0; j < nr_elements_per_queue; j++) {
+				double u = rte_drand();
+				application_array[i][j].iterations = (uint64_t) (-((double)srv_iterations0) * log(u));
+				application_array[i][j].randomness = rte_rand();
+			}
+		} else {
+			for(uint32_t j = 0; j < nr_elements_per_queue; j++) {
+				double u = rte_drand();
+				if(u < srv_mode) {
+					application_array[i][j].iterations = srv_iterations0;
+				} else {
+					application_array[i][j].iterations = srv_iterations1;
+				}
+			}
+		}
 	}
 }
 
-// Allocate nodes for all incoming packets
+// Allocate and create all nodes for incoming packets
 void create_incoming_array() {
-	incoming_array = (node_t*) rte_malloc(NULL, nr_packets * 1.4 * sizeof(node_t), 0);
+	incoming_array = (node_t*) rte_malloc(NULL, rate * duration * 2 * sizeof(node_t), 0);
 	if(incoming_array == NULL) {
 		rte_exit(EXIT_FAILURE, "Cannot alloc the incoming array.\n");
 	}
 } 
 
+// Allocate and create an array for all interarrival packets for rate specified.
+void create_interarrival_array() {
+	uint64_t rate_per_queue = rate/nr_queues;
+	uint64_t nr_elements_per_queue = 2 * rate_per_queue * duration;
+
+	interarrival_array = (uint32_t**) rte_malloc(NULL, nr_queues * sizeof(uint32_t*), 64);
+	if(interarrival_array == NULL) {
+		rte_exit(EXIT_FAILURE, "Cannot alloc the interarrival_gap array.\n");
+	}
+
+	nr_never_sent = (uint32_t*) rte_zmalloc(NULL, nr_queues * sizeof(uint32_t), 64);
+	if(nr_never_sent == NULL) {
+		rte_exit(EXIT_FAILURE, "Cannot alloc the nr_never_sent array.\n");
+	}
+
+	for(uint64_t i = 0; i < nr_queues; i++) {
+		interarrival_array[i] = (uint32_t*) rte_malloc(NULL, nr_elements_per_queue * sizeof(uint32_t), 0);
+		if(interarrival_array[i] == NULL) {
+			rte_exit(EXIT_FAILURE, "Cannot alloc the interarrival_gap array.\n");
+		}
+		
+		uint32_t *interarrival_gap = interarrival_array[i];
+		if(distribution == UNIFORM_VALUE) {
+			double mean = (1.0/rate_per_queue) * 1000000.0;
+			for(uint64_t j = 0; j < nr_elements_per_queue; j++) {
+				interarrival_gap[j] = mean * TICKS_PER_US;
+			}
+		} else {
+			double lambda = 1.0/(1000000.0/rate_per_queue);
+			for(uint64_t j = 0; j < nr_elements_per_queue; j++) {
+				interarrival_gap[j] = sample(lambda) * TICKS_PER_US;
+			}
+		}
+	} 
+}
+
 // Allocate and create an array for all flow indentier to send to the server
 void create_flow_indexes_array() {
-	flow_indexes_array = (uint16_t*) rte_malloc(NULL, nr_packets * sizeof(uint16_t), 0);
+	uint64_t rate_per_queue = rate/nr_queues;
+	uint64_t nr_elements_per_queue = 2 * rate_per_queue * duration;
+
+	flow_indexes_array = (uint16_t**) rte_malloc(NULL, nr_queues * sizeof(uint16_t*), 64);
 	if(flow_indexes_array == NULL) {
 		rte_exit(EXIT_FAILURE, "Cannot alloc the flow_indexes array.\n");
 	}
 
-	for(uint64_t i = 0; i < nr_packets; i++) {
-		flow_indexes_array[i] = i % nr_flows;
+	for(uint64_t i = 0; i < nr_queues; i++) {
+		flow_indexes_array[i] = (uint16_t*) rte_malloc(NULL, nr_elements_per_queue * sizeof(uint16_t), 0);
+		if(flow_indexes_array[i] == NULL) {
+			rte_exit(EXIT_FAILURE, "Cannot alloc the flow_indexes array.\n");
+		}
+	}
+
+	uint32_t last[nr_queues];
+	memset(last, 0, nr_queues * sizeof(uint32_t));
+
+	for(uint64_t f = 0; f < nr_flows; f++) {
+		uint32_t idx = f % nr_queues;
+		flow_indexes_array[idx][last[idx]++] = f;
+	}
+
+	for(uint64_t q = 0; q < nr_queues; q++) {
+		for(uint32_t i = last[q]; i < nr_elements_per_queue; i++) {
+			flow_indexes_array[q][i] = flow_indexes_array[q][i % last[q]];
+		}
 	}
 }
 
@@ -112,10 +150,17 @@ void clean_heap() {
 // Usage message
 static void usage(const char *prgname) {
 	printf("%s [EAL options] -- \n"
+		"  -d DISTRIBUTION: <uniform|exponential>\n"
+		"  -r RATE: rate in pps\n"
 		"  -f FLOWS: number of flows\n"
 		"  -s SIZE: frame size in bytes\n"
 		"  -t TIME: time in seconds to send packets\n"
+		"  -q QUEUES: number of queues\n"
 		"  -e SEED: seed\n"
+		"  -D DISTRIBUTION: <uniform|exponential|bimodal> on the server\n"
+		"  -i INSTRUCTIONS: number of instructions on the server\n"
+		"  -j INSTRUCTIONS: number of instructions on the server\n"
+		"  -m MODE: mode for Bimodal distribution\n"
 		"  -c FILENAME: name of the configuration file\n"
 		"  -o FILENAME: name of the output file\n",
 		prgname
@@ -129,9 +174,55 @@ int app_parse_args(int argc, char **argv) {
 	char *prgname = argv[0];
 
 	argvopt = argv;
-	while ((opt = getopt(argc, argvopt, "r:f:s:t:c:C:o:e:i:")) != EOF) {
+	while ((opt = getopt(argc, argvopt, "d:r:f:s:q:p:t:c:o:e:D:i:j:m:")) != EOF) {
 		switch (opt) {
-		// rate
+		// distribution on the client
+		case 'd':
+			if(strcmp(optarg, "uniform") == 0) {
+				// Uniform distribution
+				distribution = UNIFORM_VALUE;
+			} else if(strcmp(optarg, "exponential") == 0) {
+				// Exponential distribution
+				distribution = EXPONENTIAL_VALUE;
+			} else {
+				usage(prgname);
+				rte_exit(EXIT_FAILURE, "Invalid arguments.\n");
+			}
+			break;
+
+		// distribution on the server
+		case 'D':
+			if(strcmp(optarg, "constant") == 0) {
+				// Constant
+				srv_distribution = CONSTANT_VALUE;
+			} else if(strcmp(optarg, "exponential") == 0) {
+				// Exponential distribution
+				srv_distribution = EXPONENTIAL_VALUE;
+			} else if(strcmp(optarg, "bimodal") == 0) {
+				// Bimodal distribution
+				srv_distribution = BIMODAL_VALUE;
+			} else {
+				usage(prgname);
+				rte_exit(EXIT_FAILURE, "Invalid arguments.\n");
+			}
+			break;
+			
+		// iterations on the server
+		case 'i':
+			srv_iterations0 = process_int_arg(optarg);
+			break;
+		
+		// iterations on the server
+		case 'j':
+			srv_iterations1 = process_int_arg(optarg);
+			break;
+
+		// mode on the server
+		case 'm':
+			srv_mode = process_double_arg(optarg);
+			break;
+
+		// rate (pps)
 		case 'r':
 			rate = process_int_arg(optarg);
 			break;
@@ -155,6 +246,12 @@ int app_parse_args(int argc, char **argv) {
 			duration = process_int_arg(optarg);
 			break;
 		
+		// queues
+		case 'q':
+			nr_queues = process_int_arg(optarg);
+			min_lcores = 1 + 2 + nr_queues;
+			break;
+
 		// seed
 		case 'e':
 			seed = process_int_arg(optarg);
@@ -178,6 +275,10 @@ int app_parse_args(int argc, char **argv) {
 
 	if(optind >= 0) {
 		argv[optind - 1] = prgname;
+	}
+
+	if(nr_flows < nr_queues) {
+		rte_exit(EXIT_FAILURE, "The number of flows should be bigger than the number of queues.\n");
 	}
 
 	ret = optind-1;
@@ -213,15 +314,18 @@ void print_stats_output() {
 		rte_exit(EXIT_FAILURE, "Cannot open the output file.\n");
 	}
 
-	uint64_t total_never_sent = nr_never_sent;
-	if((incoming_idx + total_never_sent) != nr_packets) {
+	uint64_t total_never_sent = 0;
+	for(uint32_t i = 0; i < nr_queues; i++) {
+		total_never_sent += nr_never_sent[i];
+	}
+	if((incoming_idx + total_never_sent) != 2 * rate * duration) {
 		printf("ERROR: received %d and %ld never sent\n", incoming_idx, total_never_sent);
 		fclose(fp);
 		return;
 	}
 
-	printf("incoming_idx = %d -- never_sent = %ld\n", incoming_idx, total_never_sent);
-	uint64_t j = nr_packets/2;
+	printf("\nincoming_idx = %d -- never_sent = %ld\n", incoming_idx, total_never_sent);
+	uint64_t j = rate * duration - total_never_sent;
 
 	// print the RTT latency in (ns)
 	node_t *cur;
@@ -279,33 +383,13 @@ void process_config_file(char *cfg_file) {
 		dst_tcp_port = port;
 	}
 
-	// load server calibration
-	entry = (char*) rte_cfgfile_get_entry(file, "application", "sqrt");
-	if(entry) {
-		double duration;
-		sscanf(entry, "%lf", &duration);
-		sqrt_time_one_iteration = duration;
-	}
-	entry = (char*) rte_cfgfile_get_entry(file, "application", "stridedmem");
-	if(entry) {
-		double duration;
-		sscanf(entry, "%lf", &duration);
-		stridedmem_time_one_iteration = duration;
-	}
-	entry = (char*) rte_cfgfile_get_entry(file, "application", "null");
-	if(entry) {
-		double duration;
-		sscanf(entry, "%lf", &duration);
-		null_time_one_iteration = duration;
-	}
-
 	// close the file
 	rte_cfgfile_close(file);
 }
 
 // Fill the data into packet payload properly
-inline void fill_payload_pkt(struct rte_mbuf *pkt, uint32_t i, uint64_t value) {
+inline void fill_payload_pkt(struct rte_mbuf *pkt, uint32_t idx, uint64_t value) {
 	uint8_t *payload = (uint8_t*) rte_pktmbuf_mtod_offset(pkt, uint8_t*, PAYLOAD_OFFSET);
 
-	((uint64_t*) payload)[i] = value;
+	((uint64_t*) payload)[idx] = value;
 }
