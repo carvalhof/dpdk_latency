@@ -237,7 +237,7 @@ void print_stats_output() {
 	}
 
 	printf("\nincoming_idx = %d -- never_sent = %ld\n", incoming_idx, total_never_sent);
-	uint64_t j = 0;
+	uint64_t j = incoming_idx/2;
 
 	// print the RTT latency in (ns)
 	node_t *cur;
