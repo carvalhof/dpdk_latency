@@ -282,14 +282,9 @@ void print_stats_output() {
 	for(uint32_t i = 0; i < nr_queues; i++) {
 		total_never_sent += nr_never_sent[i];
 	}
-	if((incoming_idx + total_never_sent) != 2 * rate * duration) {
-		printf("ERROR: received %d and %ld never sent\n", incoming_idx, total_never_sent);
-		fclose(fp);
-		return;
-	}
 
 	printf("\nincoming_idx = %d -- never_sent = %ld\n", incoming_idx, total_never_sent);
-	uint64_t j = rate * duration - total_never_sent;
+	uint64_t j = 0;
 
 	// print the RTT latency in (ns)
 	node_t *cur;

@@ -61,36 +61,12 @@ int process_rx_pkt(struct rte_mbuf *pkt, node_t *incoming, uint32_t *incoming_id
 	// get TCP header
 	struct rte_tcp_hdr *tcp_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_tcp_hdr *, sizeof(struct rte_ether_hdr) + (ipv4_hdr->version_ihl & 0x0f)*4);
 
-	// retrieve the index of the flow from the NIC (NIC tags the packet according the 5-tuple using DPDK rte_flow)
-	uint32_t flow_id = pkt->hash.fdir.hi;
-
-	// get control block for the flow
-	tcp_control_block_t *block = &tcp_control_blocks[flow_id];
-
-	// update receive window from the packet
-	rte_atomic16_set(&block->tcb_rwin, tcp_hdr->rx_win);
-
 	// get TCP payload size
 	uint32_t packet_data_size = rte_be_to_cpu_16(ipv4_hdr->total_length) - ((ipv4_hdr->version_ihl & 0x0f)*4) - ((tcp_hdr->data_off >> 4)*4);
 
 	// do not process empty packets
 	if(unlikely(packet_data_size == 0)) {
 		return 0;
-	}
-
-	// do not process retransmitted packets
-	uint32_t seq = rte_be_to_cpu_32(tcp_hdr->sent_seq);
-	if(SEQ_LT(block->last_seq_recv, seq)) {
-		block->last_seq_recv = seq;
-	} else {
-		return 0;
-	}
-
-	// update ACK number in the TCP control block from the packet
-	uint32_t ack_cur = rte_be_to_cpu_32(rte_atomic32_read(&block->tcb_next_ack));
-	uint32_t ack_hdr = rte_be_to_cpu_32(tcp_hdr->sent_seq) + (packet_data_size);
-	if(SEQ_LEQ(ack_cur, ack_hdr)) {
-		rte_atomic32_set(&block->tcb_next_ack, tcp_hdr->sent_seq + rte_cpu_to_be_32(packet_data_size));
 	}
 
 	// obtain both timestamp from the packet
@@ -199,12 +175,6 @@ static int lcore_tx(void *arg) {
 		// get the packet
 		pkt = rte_pktmbuf_alloc(pktmbuf_pool_tx);
 		fill_tcp_packet(block, pkt);
-
-		// check the receive window for this flow
-		uint16_t rx_wnd = rte_atomic16_read(&block->tcb_rwin);
-		while(unlikely(rx_wnd < tcp_payload_size)) { 
-			rx_wnd = rte_atomic16_read(&block->tcb_rwin);
-		}
 
 		// fill the timestamp, flow id, server iterations, and server randomness into the packet payload
 		fill_payload_pkt(pkt, 0, next_tsc);
