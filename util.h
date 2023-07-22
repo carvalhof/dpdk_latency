@@ -65,15 +65,11 @@ extern uint32_t min_lcores;
 extern uint32_t tcp_payload_size;
 
 uint64_t idx;
-uint64_t csv_offset;
 uint64_t srv_application;
 double sqrt_time_one_iteration;
 double null_time_one_iteration;
 double stridedmem_time_one_iteration;
 double srv_time_in_ns_per_instruction;
-char csv_filename[MAXSTRLEN];
-char csv_start_time[MAXSTRLEN];
-char csv_end_time[MAXSTRLEN];
 
 extern uint64_t TICKS_PER_US;
 extern uint32_t nr_never_sent;
@@ -98,7 +94,6 @@ void clean_heap();
 void wait_timeout();
 void print_dpdk_stats();
 void print_stats_output();
-void process_csv_file();
 void process_config_file();
 void create_incoming_array();
 void create_application_array();

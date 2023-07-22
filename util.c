@@ -81,75 +81,6 @@ inline void process() {
 	}
 }
 
-// Process the CSV file, creating the auxiliary structures
-void process_csv_file() {
-	char buffer[MAXSTRLEN];
-	FILE* fp = fopen(csv_filename, "r");
-	if(!fp) {
-		fprintf(stderr, "Error: %s\n", strerror(errno));
-		exit(EXIT_FAILURE);
-	}
-
-	if(srv_application == SQRT_APPLICATION_VALUE) {
-		srv_time_in_ns_per_instruction = sqrt_time_one_iteration;
-	} else if(srv_application == STRIDEDMEM_APPLICATION_VALUE) {
-		srv_time_in_ns_per_instruction = stridedmem_time_one_iteration;
-	} else if(srv_application == NULL_APPLICATION_VALUE) {
-		srv_time_in_ns_per_instruction = null_time_one_iteration;
-	}
-
-	idx = 0;
-	uint32_t offset = csv_offset;
-	nr_packets = get_nr_packets(fp, offset);
-	rewind(fp);
-
-	create_incoming_array();
-	create_flow_indexes_array();
-
-	// Allocates an array for all outgoing packets
-	interarrival_array = (uint32_t*) rte_malloc(NULL, nr_packets * sizeof(uint32_t), 64);
-	if(interarrival_array == NULL) {
-		rte_exit(EXIT_FAILURE, "Cannot alloc the interarrival_gap array.\n");
-	}
-	nr_never_sent = 0;
-
-	// Allocates an array for the service time
-	application_array = (application_node_t*) rte_malloc(NULL, nr_packets * sizeof(application_node_t), 64);
-	if(application_array == NULL) {
-		rte_exit(EXIT_FAILURE, "Cannot alloc the application array.\n");
-	}
-
-	// Skipping the first line
-	char* ret __attribute__((unused)) = fgets(buffer, MAXSTRLEN, fp);
-
-	// Skipping until reach to the 'offset' line
-	for(uint32_t i = 0; i < offset; i++) {
-		ret = fgets(buffer, MAXSTRLEN, fp);
-	}
-
-	// 1st iteration
-	// Read the line
-	ret = fgets(buffer, MAXSTRLEN, fp);
-	// Tokenizer the buffer
-	char *token = strtok(buffer, ",");
-	// Store the first time
-	strcpy(csv_start_time, token);
-	// Process the first entry
-	process();
-
-	for(uint32_t i = 1; i < 2*duration - 1; i++) {
-		ret = fgets(buffer, MAXSTRLEN, fp);
-		ret = strtok(buffer, ",");
-		process();
-	}
-
-	// Last iteration
-	ret = fgets(buffer, MAXSTRLEN, fp);
-	token = strtok(buffer, ",");
-	strcpy(csv_end_time, token);
-	process();
-}
-
 // Allocate nodes for all incoming packets
 void create_incoming_array() {
 	incoming_array = (node_t*) rte_malloc(NULL, nr_packets * 1.4 * sizeof(node_t), 0);
@@ -185,11 +116,8 @@ static void usage(const char *prgname) {
 		"  -s SIZE: frame size in bytes\n"
 		"  -t TIME: time in seconds to send packets\n"
 		"  -e SEED: seed\n"
-		"  -a APPLICATION: <sqrt|stridedmem|null> on the server\n"
-		"  -i OFFSET: offset of the CSV file\n"
 		"  -c FILENAME: name of the configuration file\n"
-		"  -o FILENAME: name of the output file\n"
-		"  -C FILENAME: name of the CSV file\n",
+		"  -o FILENAME: name of the output file\n",
 		prgname
 	);
 }
@@ -203,11 +131,6 @@ int app_parse_args(int argc, char **argv) {
 	argvopt = argv;
 	while ((opt = getopt(argc, argvopt, "a:f:s:t:c:C:o:e:i:")) != EOF) {
 		switch (opt) {
-		// offset of the CSV file
-		case 'i':
-			csv_offset = process_int_arg(optarg);
-			break;
-		
 		// flows
 		case 'f':
 			nr_flows = process_int_arg(optarg);
@@ -232,33 +155,11 @@ int app_parse_args(int argc, char **argv) {
 			seed = process_int_arg(optarg);
 			break;
 
-		// server's application
-		case 'a':
-			if(strcmp(optarg, "sqrt") == 0) {
-				// Square root
-				srv_application = SQRT_APPLICATION_VALUE;
-			} else if(strcmp(optarg, "stridedmem") == 0) {
-				// Stridedmem
-				srv_application = STRIDEDMEM_APPLICATION_VALUE;
-			} else if(strcmp(optarg, "null") == 0) {
-				// Null (busy waiting)
-				srv_application = NULL_APPLICATION_VALUE;
-			} else {
-				usage(prgname);
-				rte_exit(EXIT_FAILURE, "Invalid arguments.\n");
-			}
-			break;
-
 		// config file name
 		case 'c':
 			process_config_file(optarg);
 			break;
 		
-		// CSV file
-		case 'C':
-			strcpy(csv_filename, optarg);
-			break;
-
 		// output mode
 		case 'o':
 			strcpy(output_file, optarg);
@@ -314,7 +215,6 @@ void print_stats_output() {
 		return;
 	}
 
-	printf("\nStart/End -- %s -- %s\n", csv_start_time, csv_end_time);
 	printf("incoming_idx = %d -- never_sent = %ld\n", incoming_idx, total_never_sent);
 	uint64_t j = nr_packets/2;
 
