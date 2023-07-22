@@ -155,7 +155,6 @@ static int lcore_tx(void *arg) {
 	struct rte_mbuf *pkt;
 	uint16_t *flow_indexes = flow_indexes_array[qid];
 	uint32_t *interarrival_gap = interarrival_array[qid];
-	application_node_t *app_array = application_array[qid];
 
 	uint64_t next_tsc = rte_rdtsc() + interarrival_gap[0];
 

@@ -16,13 +16,6 @@ static uint32_t process_int_arg(const char *arg) {
 	return strtoul(arg, &end, 10);
 }
 
-// Convert string type into double type
-static double process_double_arg(const char *arg) {
-	char *end;
-
-	return strtod(arg, &end);
-}
-
 // Allocate and create all application nodes
 void create_application_array() {
 	uint64_t rate_per_queue = rate/nr_queues;
