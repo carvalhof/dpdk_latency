@@ -16,46 +16,6 @@ static uint32_t process_int_arg(const char *arg) {
 	return strtoul(arg, &end, 10);
 }
 
-// Allocate and create all application nodes
-void create_application_array() {
-	uint64_t rate_per_queue = rate/nr_queues;
-	uint64_t nr_elements_per_queue = (2 * rate_per_queue * duration);
-
-	application_array = (application_node_t**) rte_malloc(NULL, nr_queues * sizeof(application_node_t*), 64);
-	if(application_array == NULL) {
-		rte_exit(EXIT_FAILURE, "Cannot alloc the application array.\n");
-	}
-
-	for(uint64_t i = 0; i < nr_queues; i++) {
-		application_array[i] = (application_node_t*) rte_malloc(NULL, nr_elements_per_queue * sizeof(application_node_t), 0);
-		if(application_array[i] == NULL) {
-			rte_exit(EXIT_FAILURE, "Cannot alloc the application array.\n");
-		}
-
-		if(srv_distribution == CONSTANT_VALUE) {
-			for(uint32_t j = 0; j < nr_elements_per_queue; j++) {
-				application_array[i][j].iterations = srv_iterations0;
-				application_array[i][j].randomness = rte_rand();
-			}
-		} else if(srv_distribution == EXPONENTIAL_VALUE) {
-			for(uint32_t j = 0; j < nr_elements_per_queue; j++) {
-				double u = rte_drand();
-				application_array[i][j].iterations = (uint64_t) (-((double)srv_iterations0) * log(u));
-				application_array[i][j].randomness = rte_rand();
-			}
-		} else {
-			for(uint32_t j = 0; j < nr_elements_per_queue; j++) {
-				double u = rte_drand();
-				if(u < srv_mode) {
-					application_array[i][j].iterations = srv_iterations0;
-				} else {
-					application_array[i][j].iterations = srv_iterations1;
-				}
-			}
-		}
-	}
-}
-
 // Allocate and create all nodes for incoming packets
 void create_incoming_array() {
 	incoming_array = (node_t*) rte_malloc(NULL, rate * duration * 2 * sizeof(node_t), 0);

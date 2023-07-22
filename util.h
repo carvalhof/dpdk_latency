@@ -91,7 +91,6 @@ void print_dpdk_stats();
 void print_stats_output();
 void process_config_file();
 void create_incoming_array();
-void create_application_array();
 void create_interarrival_array();
 void create_flow_indexes_array();
 int app_parse_args(int argc, char **argv);
