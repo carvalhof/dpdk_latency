@@ -249,8 +249,6 @@ int main(int argc, char **argv) {
 	uint16_t portid = 0;
 	init_DPDK(portid, 1, seed);
 
-	process_csv_file();
-
 	// initialize TCP control blocks
 	init_tcp_blocks();
 
