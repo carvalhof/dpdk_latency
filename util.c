@@ -157,10 +157,6 @@ static void usage(const char *prgname) {
 		"  -t TIME: time in seconds to send packets\n"
 		"  -q QUEUES: number of queues\n"
 		"  -e SEED: seed\n"
-		"  -D DISTRIBUTION: <uniform|exponential|bimodal> on the server\n"
-		"  -i INSTRUCTIONS: number of instructions on the server\n"
-		"  -j INSTRUCTIONS: number of instructions on the server\n"
-		"  -m MODE: mode for Bimodal distribution\n"
 		"  -c FILENAME: name of the configuration file\n"
 		"  -o FILENAME: name of the output file\n",
 		prgname
@@ -188,38 +184,6 @@ int app_parse_args(int argc, char **argv) {
 				usage(prgname);
 				rte_exit(EXIT_FAILURE, "Invalid arguments.\n");
 			}
-			break;
-
-		// distribution on the server
-		case 'D':
-			if(strcmp(optarg, "constant") == 0) {
-				// Constant
-				srv_distribution = CONSTANT_VALUE;
-			} else if(strcmp(optarg, "exponential") == 0) {
-				// Exponential distribution
-				srv_distribution = EXPONENTIAL_VALUE;
-			} else if(strcmp(optarg, "bimodal") == 0) {
-				// Bimodal distribution
-				srv_distribution = BIMODAL_VALUE;
-			} else {
-				usage(prgname);
-				rte_exit(EXIT_FAILURE, "Invalid arguments.\n");
-			}
-			break;
-			
-		// iterations on the server
-		case 'i':
-			srv_iterations0 = process_int_arg(optarg);
-			break;
-		
-		// iterations on the server
-		case 'j':
-			srv_iterations1 = process_int_arg(optarg);
-			break;
-
-		// mode on the server
-		case 'm':
-			srv_mode = process_double_arg(optarg);
 			break;
 
 		// rate (pps)
@@ -332,10 +296,8 @@ void print_stats_output() {
 	for(; j < incoming_idx; j++) {
 		cur = &incoming_array[j];
 
-		fprintf(fp, "%lu\t%lu\t0x%02lx\n", 
-			((uint64_t)((cur->timestamp_rx - cur->timestamp_tx)/((double)TICKS_PER_US/1000))),
-			cur->flow_id,
-			cur->worker_id
+		fprintf(fp, "%lu\n", 
+			((uint64_t)((cur->timestamp_rx - cur->timestamp_tx)/((double)TICKS_PER_US/1000)))
 		);
 	}
 

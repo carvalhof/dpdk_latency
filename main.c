@@ -97,93 +97,13 @@ int process_rx_pkt(struct rte_mbuf *pkt, node_t *incoming, uint32_t *incoming_id
 	uint64_t *payload = (uint64_t *)(((uint8_t*) tcp_hdr) + ((tcp_hdr->data_off >> 4)*4));
 	uint64_t t0 = payload[0];
 	uint64_t t1 = payload[1];
-	uint64_t f_id = payload[2];
-	uint64_t w_id = payload[3];
 
 	// fill the node previously allocated
 	node_t *node = &incoming[(*incoming_idx)++];
 	node->timestamp_tx = t0;
 	node->timestamp_rx = t1;
-	node->flow_id = f_id;
-	node->worker_id = w_id;
 
 	return 1;
-}
-
-// Start the client establishing all TCP connections
-void start_client(uint16_t portid) {
-	uint16_t nb_rx;
-	uint16_t nb_tx;
-	uint64_t ts_syn;
-	uint32_t nb_retransmission;
-	struct rte_mbuf *pkt;
-	tcp_control_block_t *block;
-	struct rte_mbuf *pkts[BURST_SIZE];
-
-	for(int i = 0; i < nr_flows; i++) {
-		// get the TCP control block for the flow
-		block = &tcp_control_blocks[i];
-		// create the TCP SYN packet
-		struct rte_mbuf *syn_packet = create_syn_packet(i);
-		// insert the rte_flow in the NIC to retrieve the flow id for incoming packets of this flow
-		insert_flow(portid, i);
-
-		// send the SYN packet
-		struct rte_mbuf *syn_cloned = rte_pktmbuf_clone(syn_packet, pktmbuf_pool_tx);
-		nb_tx = rte_eth_tx_burst(portid, i % nr_queues, &syn_cloned, 1);
-		if(nb_tx != 1) {
-			rte_exit(EXIT_FAILURE, "Error to send the TCP SYN packet.\n");
-		}
-
-		// clear the counters
-		nb_retransmission = 1;
-		ts_syn = rte_rdtsc();
-
-		// change the TCP state to SYN_SENT
-		rte_atomic16_set(&block->tcb_state, TCP_SYN_SENT);
-
-		// while not received SYN+ACK packet and TCP state is not ESTABLISHED
-		while(rte_atomic16_read(&block->tcb_state) != TCP_ESTABLISHED) {
-			// receive TCP SYN+ACK packets from the NIC
-			nb_rx = rte_eth_rx_burst(portid, 0, pkts, BURST_SIZE);
-
-			for(int j = 0; j < nb_rx; j++) {
-				// process the SYN+ACK packet, returning the ACK packet to send
-				pkt = process_syn_ack_packet(pkts[j]);
-				
-				if(pkt) {
-					// send the TCP ACK packet to the server
-					nb_tx = rte_eth_tx_burst(portid, i % nr_queues, &pkt, 1);
-					if(nb_tx != 1) {
-						rte_exit(EXIT_FAILURE, "Error to send the TCP ACK packet.\n");
-					}
-				}
-			}
-			// free packets
-			rte_pktmbuf_free_bulk(pkts, nb_rx);
-
-			if((rte_rdtsc() - ts_syn) > (nb_retransmission * HANDSHAKE_TIMEOUT_IN_US) * TICKS_PER_US) {
-				nb_retransmission++;
-				syn_cloned = rte_pktmbuf_clone(syn_packet, pktmbuf_pool_tx);
-				nb_tx = rte_eth_tx_burst(portid, i % nr_queues, &syn_cloned, 1);
-				if(nb_tx != 1) {
-					rte_exit(EXIT_FAILURE, "Error to send the TCP SYN packet.\n");
-				}
-				ts_syn = rte_rdtsc();
-
-				if(nb_retransmission == HANDSHAKE_RETRANSMISSION) {
-					rte_exit(EXIT_FAILURE, "Cannot establish connection.\n");
-				}
-			}
-		}
-		rte_pktmbuf_free(syn_packet);
-	}
-
-	// Discard 3-way handshake packets in the DPDK metrics
-	rte_eth_stats_reset(portid);
-	rte_eth_xstats_reset(portid);
-	
-	rte_compiler_barrier();
 }
 
 // RX processing
@@ -288,9 +208,6 @@ static int lcore_tx(void *arg) {
 
 		// fill the timestamp, flow id, server iterations, and server randomness into the packet payload
 		fill_payload_pkt(pkt, 0, next_tsc);
-		fill_payload_pkt(pkt, 2, (uint64_t) flow_id);
-		fill_payload_pkt(pkt, 4, app_array[i].iterations);
-		fill_payload_pkt(pkt, 5, app_array[i].randomness);
 
 		// sleep for while
 		while (rte_rdtsc() < next_tsc) { }
@@ -340,9 +257,6 @@ int main(int argc, char **argv) {
 
 	// initialize TCP control blocks
 	init_tcp_blocks();
-
-	// start client (3-way handshake for each flow)
-	start_client(portid);
 
 	// create the DPDK ring for RX thread
 	create_dpdk_ring();
