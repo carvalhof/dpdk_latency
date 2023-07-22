@@ -221,9 +221,6 @@ int main(int argc, char **argv) {
 	// create interarrival array
 	create_interarrival_array();
 
-	// create application array
-	create_application_array();
-
 	// initialize TCP control blocks
 	init_tcp_blocks();
 
