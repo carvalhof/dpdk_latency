@@ -33,10 +33,6 @@
 #define IPV4_ADDR(a, b, c, d)		(((d & 0xff) << 24) | ((c & 0xff) << 16) | ((b & 0xff) << 8) | (a & 0xff))
 #define PAYLOAD_OFFSET				14+20+20
 
-#define SQRT_APPLICATION_VALUE			0
-#define STRIDEDMEM_APPLICATION_VALUE	1
-#define NULL_APPLICATION_VALUE			2
-
 typedef struct lcore_parameters {
 	uint8_t qid;
 	uint16_t portid;
@@ -46,14 +42,7 @@ typedef struct lcore_parameters {
 typedef struct timestamp_node_t {
 	uint64_t timestamp_rx;
 	uint64_t timestamp_tx;
-	uint64_t flow_id;
-	uint64_t worker_id;
 } node_t;
-
-typedef struct application_node_t {
-	uint64_t instructions;
-	uint64_t randomness;
-} application_node_t;
 
 extern uint32_t seed;
 extern uint16_t portid;
@@ -61,19 +50,7 @@ extern uint64_t duration;
 extern uint64_t nr_flows;
 extern uint64_t nr_packets;
 extern uint32_t frame_size;
-extern uint32_t min_lcores;
 extern uint32_t tcp_payload_size;
-
-uint64_t idx;
-uint64_t csv_offset;
-uint64_t srv_application;
-double sqrt_time_one_iteration;
-double null_time_one_iteration;
-double stridedmem_time_one_iteration;
-double srv_time_in_ns_per_instruction;
-char csv_filename[MAXSTRLEN];
-char csv_start_time[MAXSTRLEN];
-char csv_end_time[MAXSTRLEN];
 
 extern uint64_t TICKS_PER_US;
 extern uint32_t nr_never_sent;

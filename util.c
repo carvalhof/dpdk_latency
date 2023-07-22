@@ -16,140 +16,6 @@ static uint32_t process_int_arg(const char *arg) {
 	return strtoul(arg, &end, 10);
 }
 
-uint64_t get_instructions_for_the_server(uint32_t *arr, uint32_t randomness) {
-	uint32_t i = randomness % (PERCENTILES-1);
-	double r = (double)randomness / RAND_MAX;
-
-	uint32_t lb = arr[i];
-	uint32_t ub = arr[i+1];
-
-	uint32_t service_time = (lb + (r * (ub - lb)));
-	
-	return service_time / srv_time_in_ns_per_instruction;
-}
-
-uint64_t get_nr_packets(FILE *fp, uint32_t offset) {
-	char buffer[MAXSTRLEN];
-
-	// Skipping the first line
-	char* ret __attribute__((unused)) = fgets(buffer, MAXSTRLEN, fp);
-
-	// Skipping until reach to the 'offset' line
-	for(uint32_t i = 0; i < offset; i++) {
-		ret = fgets(buffer, MAXSTRLEN, fp);
-	}
-
-	// Couting the number of packets considering the duration
-	uint64_t n = 0;
-	for(uint32_t i = 0; i < 2*duration; i++) {
-		ret = fgets(buffer, MAXSTRLEN, fp);
-		char *token = strtok(buffer, ",");
-		for(uint32_t j = 0; j < (PERCENTILES+1); j++) {
-			token = strtok(NULL, ",");
-		}
-		token = strtok(NULL, ",");
-		n += atoi(token);
-	}
-
-	return n;
-}
-
-inline void process() {
-	char *ret __attribute__((unused));
-	ret = strtok(NULL, ",");
-
-	// Get the percentiles, choose one, and update the application_array
-	uint32_t arr[PERCENTILES];
-	for(uint32_t i = 0; i < PERCENTILES; i++) {
-		arr[i] = atoi(ret);
-		ret = strtok(NULL, ",");
-	}
-	
-	// Get the number of packets 
-	ret = strtok(NULL, ","); // Skip the QPS
-	uint32_t queries = atoi(ret);
-	double mean = (1.0/queries) * 1000000.0;
-
-	// Distributed the packets uniformly within 1-sec window
-	// Distributed the service time uniformly
-	for(uint32_t i = 0; i < queries; i++) {
-		uint32_t j = rand();
-		application_array[idx].instructions = get_instructions_for_the_server(arr, j);
-		application_array[idx].randomness = j;
-		interarrival_array[idx] = mean * TICKS_PER_US;
-		idx++;
-	}
-}
-
-// Process the CSV file, creating the auxiliary structures
-void process_csv_file() {
-	char buffer[MAXSTRLEN];
-	FILE* fp = fopen(csv_filename, "r");
-	if(!fp) {
-		fprintf(stderr, "Error: %s\n", strerror(errno));
-		exit(EXIT_FAILURE);
-	}
-
-	if(srv_application == SQRT_APPLICATION_VALUE) {
-		srv_time_in_ns_per_instruction = sqrt_time_one_iteration;
-	} else if(srv_application == STRIDEDMEM_APPLICATION_VALUE) {
-		srv_time_in_ns_per_instruction = stridedmem_time_one_iteration;
-	} else if(srv_application == NULL_APPLICATION_VALUE) {
-		srv_time_in_ns_per_instruction = null_time_one_iteration;
-	}
-
-	idx = 0;
-	uint32_t offset = csv_offset;
-	nr_packets = get_nr_packets(fp, offset);
-	rewind(fp);
-
-	create_incoming_array();
-	create_flow_indexes_array();
-
-	// Allocates an array for all outgoing packets
-	interarrival_array = (uint32_t*) rte_malloc(NULL, nr_packets * sizeof(uint32_t), 64);
-	if(interarrival_array == NULL) {
-		rte_exit(EXIT_FAILURE, "Cannot alloc the interarrival_gap array.\n");
-	}
-	nr_never_sent = 0;
-
-	// Allocates an array for the service time
-	application_array = (application_node_t*) rte_malloc(NULL, nr_packets * sizeof(application_node_t), 64);
-	if(application_array == NULL) {
-		rte_exit(EXIT_FAILURE, "Cannot alloc the application array.\n");
-	}
-
-	// Skipping the first line
-	char* ret __attribute__((unused)) = fgets(buffer, MAXSTRLEN, fp);
-
-	// Skipping until reach to the 'offset' line
-	for(uint32_t i = 0; i < offset; i++) {
-		ret = fgets(buffer, MAXSTRLEN, fp);
-	}
-
-	// 1st iteration
-	// Read the line
-	ret = fgets(buffer, MAXSTRLEN, fp);
-	// Tokenizer the buffer
-	char *token = strtok(buffer, ",");
-	// Store the first time
-	strcpy(csv_start_time, token);
-	// Process the first entry
-	process();
-
-	for(uint32_t i = 1; i < 2*duration - 1; i++) {
-		ret = fgets(buffer, MAXSTRLEN, fp);
-		ret = strtok(buffer, ",");
-		process();
-	}
-
-	// Last iteration
-	ret = fgets(buffer, MAXSTRLEN, fp);
-	token = strtok(buffer, ",");
-	strcpy(csv_end_time, token);
-	process();
-}
-
 // Allocate nodes for all incoming packets
 void create_incoming_array() {
 	incoming_array = (node_t*) rte_malloc(NULL, nr_packets * 1.4 * sizeof(node_t), 0);
@@ -185,11 +51,8 @@ static void usage(const char *prgname) {
 		"  -s SIZE: frame size in bytes\n"
 		"  -t TIME: time in seconds to send packets\n"
 		"  -e SEED: seed\n"
-		"  -a APPLICATION: <sqrt|stridedmem|null> on the server\n"
-		"  -i OFFSET: offset of the CSV file\n"
 		"  -c FILENAME: name of the configuration file\n"
 		"  -o FILENAME: name of the output file\n"
-		"  -C FILENAME: name of the CSV file\n",
 		prgname
 	);
 }
@@ -203,11 +66,6 @@ int app_parse_args(int argc, char **argv) {
 	argvopt = argv;
 	while ((opt = getopt(argc, argvopt, "a:f:s:t:c:C:o:e:i:")) != EOF) {
 		switch (opt) {
-		// offset of the CSV file
-		case 'i':
-			csv_offset = process_int_arg(optarg);
-			break;
-		
 		// flows
 		case 'f':
 			nr_flows = process_int_arg(optarg);
@@ -232,33 +90,11 @@ int app_parse_args(int argc, char **argv) {
 			seed = process_int_arg(optarg);
 			break;
 
-		// server's application
-		case 'a':
-			if(strcmp(optarg, "sqrt") == 0) {
-				// Square root
-				srv_application = SQRT_APPLICATION_VALUE;
-			} else if(strcmp(optarg, "stridedmem") == 0) {
-				// Stridedmem
-				srv_application = STRIDEDMEM_APPLICATION_VALUE;
-			} else if(strcmp(optarg, "null") == 0) {
-				// Null (busy waiting)
-				srv_application = NULL_APPLICATION_VALUE;
-			} else {
-				usage(prgname);
-				rte_exit(EXIT_FAILURE, "Invalid arguments.\n");
-			}
-			break;
-
 		// config file name
 		case 'c':
 			process_config_file(optarg);
 			break;
 		
-		// CSV file
-		case 'C':
-			strcpy(csv_filename, optarg);
-			break;
-
 		// output mode
 		case 'o':
 			strcpy(output_file, optarg);
@@ -323,10 +159,8 @@ void print_stats_output() {
 	for(; j < incoming_idx; j++) {
 		cur = &incoming_array[j];
 
-		fprintf(fp, "%lu\t%lu\t0x%02lx\n", 
-			((uint64_t)((cur->timestamp_rx - cur->timestamp_tx)/((double)TICKS_PER_US/1000))),
-			cur->flow_id,
-			cur->worker_id
+		fprintf(fp, "%lu\n", 
+			((uint64_t)((cur->timestamp_rx - cur->timestamp_tx)/((double)TICKS_PER_US/1000)))
 		);
 	}
 
@@ -372,26 +206,6 @@ void process_config_file(char *cfg_file) {
 		uint16_t port;
 		sscanf(entry, "%hu", &port);
 		dst_tcp_port = port;
-	}
-
-	// load server calibration
-	entry = (char*) rte_cfgfile_get_entry(file, "application", "sqrt");
-	if(entry) {
-		double duration;
-		sscanf(entry, "%lf", &duration);
-		sqrt_time_one_iteration = duration;
-	}
-	entry = (char*) rte_cfgfile_get_entry(file, "application", "stridedmem");
-	if(entry) {
-		double duration;
-		sscanf(entry, "%lf", &duration);
-		stridedmem_time_one_iteration = duration;
-	}
-	entry = (char*) rte_cfgfile_get_entry(file, "application", "null");
-	if(entry) {
-		double duration;
-		sscanf(entry, "%lf", &duration);
-		null_time_one_iteration = duration;
 	}
 
 	// close the file
