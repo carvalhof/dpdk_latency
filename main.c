@@ -8,52 +8,39 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-#include <math.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <getopt.h>
-#include <string.h>
-
-#include <rte_ip.h>
-#include <rte_eal.h>
-#include <rte_log.h>
-#include <rte_tcp.h>
-#include <rte_flow.h>
-#include <rte_mbuf.h>
-#include <rte_ring.h>
-#include <rte_ether.h>
-#include <rte_atomic.h>
-#include <rte_ethdev.h>
-#include <rte_malloc.h>
-#include <rte_cfgfile.h>
-#include <rte_mempool.h>
+#include "util.h"
+#include "tcp_util.h"
+#include "dpdk_util.h"
 
 // Application parameters
-uint64_t rate;
+uint32_t seed;
 uint64_t duration;
 uint64_t nr_flows;
+uint64_t nr_packets;
+uint32_t min_lcores;
 uint32_t frame_size;
+uint32_t tcp_payload_size;
 
 // General variables
 uint64_t TICKS_PER_US;
-uint16_t **flow_indexes_array;
-uint64_t **interarrival_array;
+uint16_t *flow_indexes_array;
+uint32_t *interarrival_array;
+application_node_t *application_array;
 
 // Heap and DPDK allocated
-node_t **incoming_array;
-uint64_t *incoming_idx_array;
-struct rte_mempool *pktmbuf_pool;
+uint32_t incoming_idx;
+node_t *incoming_array;
+struct rte_mempool *pktmbuf_pool_rx;
+struct rte_mempool *pktmbuf_pool_tx;
 tcp_control_block_t *tcp_control_blocks;
 
 // Internal threads variables
-volatile uint8_t quit_rx = 0;
-volatile uint8_t quit_tx = 0;
-volatile uint32_t ack_dup = 0;
-volatile uint32_t ack_empty = 0;
-volatile uint8_t quit_rx_ring = 0;
-volatile uint64_t nr_never_sent = 0;
+uint8_t quit_rx = 0;
+uint8_t quit_tx = 0;
+uint8_t quit_rx_ring = 0;
+uint32_t nr_never_sent = 0;
 lcore_param lcore_params[RTE_MAX_LCORE];
-struct rte_ring *rx_rings[RTE_MAX_LCORE];
+struct rte_ring *rx_ring;
 
 // Connection variables
 uint16_t dst_tcp_port;
@@ -63,7 +50,7 @@ struct rte_ether_addr dst_eth_addr;
 struct rte_ether_addr src_eth_addr;
 
 // Process the incoming TCP packet
-int process_rx_pkt(struct rte_mbuf *pkt, node_t *incoming, uint64_t *incoming_idx) {
+int process_rx_pkt(struct rte_mbuf *pkt, node_t *incoming, uint32_t *incoming_idx) {
 	// process only TCP packets
 	struct rte_ipv4_hdr *ipv4_hdr = rte_pktmbuf_mtod_offset(pkt, struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
 	if(unlikely(ipv4_hdr->next_proto_id != IPPROTO_TCP)) {
@@ -109,33 +96,108 @@ int process_rx_pkt(struct rte_mbuf *pkt, node_t *incoming, uint64_t *incoming_id
 	uint64_t *payload = (uint64_t *)(((uint8_t*) tcp_hdr) + ((tcp_hdr->data_off >> 4)*4));
 	uint64_t t0 = payload[0];
 	uint64_t t1 = payload[1];
+	uint64_t f_id = payload[2];
+	uint64_t w_id = payload[3];
 
 	// fill the node previously allocated
 	node_t *node = &incoming[(*incoming_idx)++];
 	node->timestamp_tx = t0;
 	node->timestamp_rx = t1;
+	node->flow_id = f_id;
+	node->worker_id = w_id;
 
 	return 1;
 }
 
+// Start the client establishing all TCP connections
+void start_client(uint16_t portid) {
+	uint16_t nb_rx;
+	uint16_t nb_tx;
+	uint64_t ts_syn;
+	uint32_t nb_retransmission;
+	struct rte_mbuf *pkt;
+	tcp_control_block_t *block;
+	struct rte_mbuf *pkts[BURST_SIZE];
+
+	for(int i = 0; i < nr_flows; i++) {
+		// get the TCP control block for the flow
+		block = &tcp_control_blocks[i];
+		// create the TCP SYN packet
+		struct rte_mbuf *syn_packet = create_syn_packet(i);
+		// insert the rte_flow in the NIC to retrieve the flow id for incoming packets of this flow
+		insert_flow(portid, i);
+
+		// send the SYN packet
+		struct rte_mbuf *syn_cloned = rte_pktmbuf_clone(syn_packet, pktmbuf_pool_tx);
+		nb_tx = rte_eth_tx_burst(portid, 0, &syn_cloned, 1);
+		if(nb_tx != 1) {
+			rte_exit(EXIT_FAILURE, "Error to send the TCP SYN packet.\n");
+		}
+
+		// clear the counters
+		nb_retransmission = 1;
+		ts_syn = rte_rdtsc();
+
+		// change the TCP state to SYN_SENT
+		rte_atomic16_set(&block->tcb_state, TCP_SYN_SENT);
+
+		// while not received SYN+ACK packet and TCP state is not ESTABLISHED
+		while(rte_atomic16_read(&block->tcb_state) != TCP_ESTABLISHED) {
+			// receive TCP SYN+ACK packets from the NIC
+			nb_rx = rte_eth_rx_burst(portid, 0, pkts, BURST_SIZE);
+
+			for(int j = 0; j < nb_rx; j++) {
+				// process the SYN+ACK packet, returning the ACK packet to send
+				pkt = process_syn_ack_packet(pkts[j]);
+				
+				if(pkt) {
+					// send the TCP ACK packet to the server
+					nb_tx = rte_eth_tx_burst(portid, 0, &pkt, 1);
+					if(nb_tx != 1) {
+						rte_exit(EXIT_FAILURE, "Error to send the TCP ACK packet.\n");
+					}
+				}
+			}
+			// free packets
+			rte_pktmbuf_free_bulk(pkts, nb_rx);
+
+			if((rte_rdtsc() - ts_syn) > (nb_retransmission * HANDSHAKE_TIMEOUT_IN_US) * TICKS_PER_US) {
+				nb_retransmission++;
+				syn_cloned = rte_pktmbuf_clone(syn_packet, pktmbuf_pool_tx);
+				nb_tx = rte_eth_tx_burst(portid, 0, &syn_cloned, 1);
+				if(nb_tx != 1) {
+					rte_exit(EXIT_FAILURE, "Error to send the TCP SYN packet.\n");
+				}
+				ts_syn = rte_rdtsc();
+
+				if(nb_retransmission == HANDSHAKE_RETRANSMISSION) {
+					rte_exit(EXIT_FAILURE, "Cannot establish connection.\n");
+				}
+			}
+		}
+		rte_pktmbuf_free(syn_packet);
+	}
+
+	// Discard 3-way handshake packets in the DPDK metrics
+	rte_eth_stats_reset(portid);
+	rte_eth_xstats_reset(portid);
+	
+	rte_compiler_barrier();
+}
+
 // RX processing
 static int lcore_rx_ring(void *arg) {
-	lcore_param *rx_conf = (lcore_param *) arg;
-	uint8_t qid = rx_conf->qid;
-
 	uint16_t nb_rx;
-	uint64_t *incoming_idx = &incoming_idx_array[qid];
-	node_t *incoming = incoming_array[qid];
 	struct rte_mbuf *pkts[BURST_SIZE];
-	struct rte_ring *rx_ring = rx_rings[qid];
+
+	incoming_idx = 0;
 
 	while(!quit_rx_ring) {
 		// retrieve packets from the RX core
 		nb_rx = rte_ring_sc_dequeue_burst(rx_ring, (void**) pkts, BURST_SIZE, NULL); 
 		for(int i = 0; i < nb_rx; i++) {
-			rte_prefetch_non_temporal(rte_pktmbuf_mtod(pkts[i], void *));
 			// process the incoming packet
-			process_rx_pkt(pkts[i], incoming, incoming_idx);
+			process_rx_pkt(pkts[i], incoming_array, &incoming_idx);
 			// free the packet
 			rte_pktmbuf_free(pkts[i]);
 		}
@@ -145,9 +207,8 @@ static int lcore_rx_ring(void *arg) {
 	do{
 		nb_rx = rte_ring_sc_dequeue_burst(rx_ring, (void**) pkts, BURST_SIZE, NULL);
 		for(int i = 0; i < nb_rx; i++) {
-			rte_prefetch_non_temporal(rte_pktmbuf_mtod(pkts[i], void *));
 			// process the incoming packet
-			process_rx_pkt(pkts[i], incoming, incoming_idx);
+			process_rx_pkt(pkts[i], incoming_array, &incoming_idx);
 			// free the packet
 			rte_pktmbuf_free(pkts[i]);
 		}
@@ -158,14 +219,13 @@ static int lcore_rx_ring(void *arg) {
 
 // Main RX processing
 static int lcore_rx(void *arg) {
-	lcore_param *rx_conf = (lcore_param *) arg;
-	uint16_t portid = rx_conf->portid;
-	uint8_t qid = rx_conf->qid;
+	uint16_t portid = 0;
+	uint8_t qid = 0;
 
 	uint64_t now;
 	uint16_t nb_rx;
+	uint16_t nb_pkts;
 	struct rte_mbuf *pkts[BURST_SIZE];
-	struct rte_ring *rx_ring = rx_rings[qid];
 	
 	while(!quit_rx) {
 		// retrieve the packets from the NIC
@@ -177,7 +237,10 @@ static int lcore_rx(void *arg) {
 			// fill the timestamp into packet payload
 			fill_payload_pkt(pkts[i], 1, now);
 		}
-		if(rte_ring_sp_enqueue_burst(rx_ring, (void* const*) pkts, nb_rx, NULL) != nb_rx) {
+
+		// enqueue the packets to the ring
+		nb_pkts = rte_ring_sp_enqueue_burst(rx_ring, (void* const*) pkts, nb_rx, NULL);
+		if(unlikely(nb_pkts != nb_rx)) {
 			rte_exit(EXIT_FAILURE, "Cannot enqueue the packet to the RX thread: %s.\n", rte_strerror(errno));
 		}
 	}
@@ -192,141 +255,53 @@ static int lcore_tx(void *arg) {
 	uint8_t qid = tx_conf->qid;
 	uint64_t nr_elements = tx_conf->nr_elements;
 
-	uint64_t i = 0;
-	uint16_t n = 1;
-	uint16_t nb_tx;
-	uint16_t nb_pkts = 0;
-	struct rte_mbuf *pkts[BURST_SIZE];
-	uint16_t *flow_indexes = flow_indexes_array[qid];
-	uint64_t *interarrival_gap = interarrival_array[qid];
-	uint64_t next_tsc = rte_rdtsc() + interarrival_gap[i];
+	struct rte_mbuf *pkt;
+	uint16_t *flow_indexes = flow_indexes_array;
+	uint32_t *interarrival_gap = interarrival_array;
+	application_node_t *app_array = application_array;
 
-	while(!quit_tx) { 
-		// reach the limit
-		if(unlikely(i >= nr_elements)) {
-			break;
+	uint64_t next_tsc = rte_rdtsc() + interarrival_gap[0];
+
+	for(uint64_t i = 0; i < nr_elements; i++) {
+		// unable to keep up with the requested rate
+		if(unlikely(rte_rdtsc() > (next_tsc + 5*TICKS_PER_US))) {
+			// count this batch as dropped
+			nr_never_sent++;
+			next_tsc += (interarrival_gap[i] + TICKS_PER_US);
+			continue;
 		}
 
 		// choose the flow to send
 		uint16_t flow_id = flow_indexes[i];
 		tcp_control_block_t *block = &tcp_control_blocks[flow_id];
 
-		// generate packets
-		for(; nb_pkts < n; nb_pkts++) {
-			pkts[nb_pkts] = rte_pktmbuf_alloc(pktmbuf_pool);
-			// fill the packet with the flow information
-			fill_tcp_packet(flow_id, pkts[nb_pkts]);
-		}
+		// get the packet
+		pkt = rte_pktmbuf_alloc(pktmbuf_pool_tx);
+		fill_tcp_packet(block, pkt);
 
-		// check receive window for that flow
+		// check the receive window for this flow
 		uint16_t rx_wnd = rte_atomic16_read(&block->tcb_rwin);
 		while(unlikely(rx_wnd < tcp_payload_size)) { 
 			rx_wnd = rte_atomic16_read(&block->tcb_rwin);
 		}
 
-		// unable to keep up with the requested rate
-		if(unlikely(rte_rdtsc() > (next_tsc + 5*TICKS_PER_US))) {
-			// count this batch as dropped
-			nr_never_sent++;
-			next_tsc += interarrival_gap[i++];
-			continue;
-		}
-
-		// fill the timestamp into the packet payload
-		for(int j = 0; j < nb_pkts; j++) {
-			fill_payload_pkt(pkts[j], 0, next_tsc);
-		}
+		// fill the timestamp, flow id, and the service time into the packet payload
+		fill_payload_pkt(pkt, 0, next_tsc);
+		fill_payload_pkt(pkt, 2, (uint64_t) flow_id);
+		fill_payload_pkt(pkt, 4, app_array[i].instructions);
+		fill_payload_pkt(pkt, 5, app_array[i].randomness);
 
 		// sleep for while
-		while (rte_rdtsc() < next_tsc) {  }
+		while (rte_rdtsc() < next_tsc) { }
 
-		// send the batch
-		nb_tx = rte_eth_tx_burst(portid, qid, pkts, nb_pkts);
-		if(unlikely(nb_tx != nb_pkts)) {
-			rte_exit(EXIT_FAILURE, "Cannot send the target packets.\n");
-		}
+		// send the packet
+		rte_eth_tx_burst(portid, qid, &pkt, 1);
 
 		// update the counter
-		nb_pkts = 0;
-		next_tsc += interarrival_gap[i++];
+		next_tsc += interarrival_gap[i];
 	}
 
 	return 0;
-}
-
-int app_parse_args(int argc, char **argv) {
-	int opt, ret;
-	char **argvopt;
-	char *prgname = argv[0];
-
-	argvopt = argv;
-	while ((opt = getopt(argc, argvopt, "d:r:f:s:q:p:t:c:o:")) != EOF) {
-		switch (opt) {
-		// distribution
-		case 'd':
-			if(strcmp(optarg, "uniform") == 0) {
-				// Uniform distribution
-				distribution = UNIFORM_VALUE;
-			} else if(strcmp(optarg, "exponential") == 0) {
-				// Exponential distribution
-				distribution = EXPONENTIAL_VALUE;
-			} else {
-				usage(prgname);
-				rte_exit(EXIT_FAILURE, "Invalid arguments.\n");
-			}
-			break;
-			
-		// rate (pps)
-		case 'r':
-			rate = process_int_arg(optarg);
-			break;
-
-		// flows
-		case 'f':
-			nr_flows = process_int_arg(optarg);
-			break;
-
-		// frame size (bytes)
-		case 's':
-			frame_size = process_int_arg(optarg);
-			if (frame_size < MIN_PKTSIZE) {
-				rte_exit(EXIT_FAILURE, "The minimum packet size is %d.\n", MIN_PKTSIZE);
-			}
-			tcp_payload_size = (frame_size - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_tcp_hdr));
-			break;
-
-		// duration (s)
-		case 't':
-			duration = process_int_arg(optarg);
-			break;
-
-		// config file name
-		case 'c':
-			process_config_file(optarg);
-			break;
-		
-		// output file
-		case 'o':
-			strcpy(output_file, optarg);
-			break;
-
-		default:
-			rte_exit(EXIT_FAILURE, "Invalid arguments.\n");
-		}
-	}
-
-	if(optind >= 0) {
-		argv[optind - 1] = prgname;
-	}
-
-	if(nr_flows < nr_queues) {
-		rte_exit(EXIT_FAILURE, "The number of flows should be bigger than the number of queues.\n");
-	}
-
-	ret = optind-1;
-	optind = 1;
-
-	return ret;
 }
 
 // main function
@@ -336,10 +311,11 @@ int main(int argc, char **argv) {
 	if(ret < 0) {
 		rte_exit(EXIT_FAILURE, "Invalid EAL parameters\n");
 	}
+
 	argc -= ret;
 	argv += ret;
 
-	// parse application arguments  
+	// parse application arguments (after the EAL ones)
 	ret = app_parse_args(argc, argv);
 	if(ret < 0) {
 		rte_exit(EXIT_FAILURE, "Invalid arguments\n");
@@ -347,39 +323,35 @@ int main(int argc, char **argv) {
 
 	// initialize DPDK
 	uint16_t portid = 0;
-	init_DPDK(portid, nr_queues);
+	init_DPDK(portid, 1, seed);
 
-	// allocate nodes for incoming packets
-	allocate_incoming_nodes();
+	process_csv_file();
 
-	// create flow indexes array
-	create_flow_indexes_array();
-
-	// create interarrival array
-	create_interarrival_array();
-	
 	// initialize TCP control blocks
 	init_tcp_blocks();
 
-	// create the DPDK rings for RX threads
-	create_dpdk_rings();
+	// start client (3-way handshake for each flow)
+	start_client(portid);
 
-	// start RX and TX threads
-	uint32_t id_lcore = rte_lcore_id();	
-	for(int i = 0; i < nr_queues; i++) {
-		lcore_params[i].portid = portid;
-		lcore_params[i].qid = i;
-		lcore_params[i].nr_elements = (rate/nr_queues) * 2 * duration;
+	// create the DPDK ring for RX thread
+	create_dpdk_ring();
 
-		id_lcore = rte_get_next_lcore(id_lcore, 1, 1);
-		rte_eal_remote_launch(lcore_rx_ring, (void*) &lcore_params[i], id_lcore);
+	// start RX thread to process incoming packets
+	uint32_t id_lcore = rte_lcore_id();
+	id_lcore = rte_get_next_lcore(id_lcore, 1, 1);
+	rte_eal_remote_launch(lcore_rx_ring, NULL, id_lcore);
 
-		id_lcore = rte_get_next_lcore(id_lcore, 1, 1);
-		rte_eal_remote_launch(lcore_rx, (void*) &lcore_params[i], id_lcore);
+	// start RX thread to receive incoming packets
+	id_lcore = rte_get_next_lcore(id_lcore, 1, 1);
+	rte_eal_remote_launch(lcore_rx, NULL, id_lcore);
 
-		id_lcore = rte_get_next_lcore(id_lcore, 1, 1);
-		rte_eal_remote_launch(lcore_tx, (void*) &lcore_params[i], id_lcore);
-	}
+	// start TX thread
+	lcore_params[0].portid = portid;
+	lcore_params[0].qid = 0;
+	lcore_params[0].nr_elements = nr_packets;
+
+	id_lcore = rte_get_next_lcore(id_lcore, 1, 1);
+	rte_eal_remote_launch(lcore_tx, (void*) &lcore_params[0], id_lcore);
 
 	// wait for duration parameter
 	wait_timeout();

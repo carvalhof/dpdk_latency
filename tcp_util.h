@@ -90,7 +90,10 @@ extern struct rte_mempool *pktmbuf_pool_tx;
 extern tcp_control_block_t *tcp_control_blocks;
 
 void init_tcp_blocks();
+struct rte_mbuf* create_syn_packet(uint16_t i);
+struct rte_mbuf *create_ack_packet(uint16_t i);
 void fill_tcp_packet(tcp_control_block_t *block, struct rte_mbuf *pkt);
 void fill_tcp_payload(uint8_t *payload, uint32_t length);
+struct rte_mbuf* process_syn_ack_packet(struct rte_mbuf* pkt);
 
 #endif // __TCP_UTIL_H__
